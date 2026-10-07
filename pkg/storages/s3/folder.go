@@ -190,6 +190,7 @@ func (folder *Folder) ListFolder() (objects []storage.Object, subFolders []stora
 			return nil, nil, err
 		}
 	} else {
+		completedPages := 0
 		listFunc := func(commonPrefixes []*s3.CommonPrefix, contents []*s3.Object) {
 			for _, prefix := range commonPrefixes {
 				subFolder := NewFolder(folder.s3API, folder.uploader, *prefix.Prefix, folder.config)
@@ -208,6 +209,7 @@ func (folder *Folder) ListFolder() (objects []storage.Object, subFolders []stora
 				objectRelativePath := strings.TrimPrefix(*object.Key, folder.path)
 				objects = append(objects, storage.NewLocalObject(objectRelativePath, *object.LastModified, *object.Size))
 			}
+			completedPages++
 		}
 
 		err = folder.listObjectsPages(prefix, delimiter, nil, listFunc)
@@ -217,9 +219,52 @@ func (folder *Folder) ListFolder() (objects []storage.Object, subFolders []stora
 		if err != nil && !isAwsNotExist(err) {
 			return nil, nil, errors.Wrapf(err, "failed to list s3 folder: '%s'", folder.path)
 		}
+		if err != nil && completedPages > 0 {
+			tracelog.WarningLogger.Printf(
+				"S3 listing incomplete after successful pages: prefix=%q completed_pages=%d error=%v",
+				folder.path, completedPages, err)
+		}
 	}
 
 	return objects, subFolders, nil
+}
+
+// ListObjectsWithPrefix lists current objects even when versioning is enabled.
+func (folder *Folder) ListObjectsWithPrefix(ctx context.Context, prefix string) ([]storage.Object, error) {
+	var objects []storage.Object
+	completedPages := 0
+	fullPrefix := folder.path + prefix
+	collect := func(contents []*s3.Object) {
+		for _, object := range contents {
+			name := strings.TrimPrefix(*object.Key, folder.path)
+			objects = append(objects, storage.NewLocalObject(name, *object.LastModified, aws.Int64Value(object.Size)))
+		}
+		completedPages++
+	}
+	var err error
+	if folder.config.UseListObjectsV1 {
+		input := &s3.ListObjectsInput{Bucket: folder.bucket, Prefix: aws.String(fullPrefix)}
+		err = folder.s3API.ListObjectsPagesWithContext(ctx, input, func(page *s3.ListObjectsOutput, _ bool) bool {
+			collect(page.Contents)
+			return true
+		})
+	} else {
+		input := &s3.ListObjectsV2Input{Bucket: folder.bucket, Prefix: aws.String(fullPrefix)}
+		err = folder.s3API.ListObjectsV2PagesWithContext(ctx, input, func(page *s3.ListObjectsV2Output, _ bool) bool {
+			collect(page.Contents)
+			return true
+		})
+	}
+	// Match ListFolder's handling of missing folders on DigitalOcean Spaces.
+	if err != nil && !isAwsNotExist(err) {
+		return nil, fmt.Errorf("list S3 objects with prefix %q: %w", fullPrefix, err)
+	}
+	if err != nil && completedPages > 0 {
+		tracelog.WarningLogger.Printf(
+			"S3 listing incomplete after successful pages: prefix=%q completed_pages=%d error=%v",
+			fullPrefix, completedPages, err)
+	}
+	return objects, nil
 }
 
 // versionInfo holds information about an S3 object version collected during listing.
@@ -331,10 +376,12 @@ func (folder *Folder) listVersions(prefix *string, delimiter *string) ([]storage
 	deletedKeys := make(map[string]bool)
 
 	// Keep the page callback small and side-effect-only: collect state; build output after paging completes.
+	completedPages := 0
 	versionsListFunc := func(out *s3.ListObjectVersionsOutput, _ bool) bool {
 		folder.addListedSubfolders(&subFolders, out.CommonPrefixes)
 		folder.collectDeleteMarkers(&deleteMarkers, deletedKeys, out.DeleteMarkers)
 		folder.collectVersions(&allVersions, out.Versions)
+		completedPages++
 		return true
 	}
 
@@ -349,6 +396,12 @@ func (folder *Folder) listVersions(prefix *string, delimiter *string) ([]storage
 	// which don't yet exist.
 	if err != nil && !isAwsNotExist(err) {
 		return nil, nil, errors.Wrapf(err, "failed to list s3 folder: '%s'", folder.path)
+	}
+
+	if err != nil && completedPages > 0 {
+		tracelog.WarningLogger.Printf(
+			"S3 listing incomplete after successful pages: prefix=%q completed_pages=%d error=%v",
+			aws.StringValue(prefix), completedPages, err)
 	}
 
 	// Convert collected versions to storage objects, applying delete-marker filtering unless requested otherwise.

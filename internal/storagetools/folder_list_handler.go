@@ -1,6 +1,7 @@
 package storagetools
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/wal-g/tracelog"
 	"github.com/wal-g/wal-g/pkg/storages/storage"
 )
 
@@ -93,9 +95,28 @@ func HandleFolderList(folder storage.Folder, recursive bool) error {
 	return nil
 }
 
+func HandleFolderListWithPrefix(ctx context.Context, folder storage.Folder, prefix string) error {
+	objects, err := storage.ListObjectsWithPrefix(ctx, folder, prefix)
+	if err != nil {
+		return fmt.Errorf("list folder with prefix: %w", err)
+	}
+	list := make([]ListElement, len(objects))
+	for i, object := range objects {
+		list[i] = NewListObject(object)
+	}
+	if err := WriteObjectsList(list, os.Stdout); err != nil {
+		return fmt.Errorf("write folder listing: %w", err)
+	}
+	return nil
+}
+
 func WriteObjectsList(objects []ListElement, output io.Writer) error {
 	writer := tabwriter.NewWriter(output, 0, 0, 1, ' ', 0)
-	defer writer.Flush()
+	defer func() {
+		if err := writer.Flush(); err != nil {
+			tracelog.WarningLogger.Printf("failed to flush storage listing output: %v", err)
+		}
+	}()
 	_, err := fmt.Fprintln(writer, "type\tsize\tlast modified\tname")
 	if err != nil {
 		return err
